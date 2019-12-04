@@ -1,0 +1,4 @@
+*.pyc
+build/
+search_ansible_hosts.egg-info/
+dist/

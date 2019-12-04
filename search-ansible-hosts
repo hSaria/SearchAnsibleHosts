@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Ansible inventory searching for rapid use"""
+
+import argparse
+import os
+import signal
+import socket
+import sys
+import time
+
+# pylint: disable=broad-except, import-outside-toplevel
+## Catching all because we're not interested in the error type. Some imports are
+## quite taxing, so they only performed when needed.
+
+SERVER_STARTUP_DELAY = 0.1
+SOCK_BACKLOG = 1024
+SOCK_RECV_MAX = 65536
+
+
+def args_init():
+    """Initialze arguments and return the output of `parse_args`."""
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('pattern',
+                        type=str,
+                        nargs='?',
+                        help='host pattern (default: %(default)s)',
+                        default='all')
+    parser.add_argument('-i',
+                        '--inventory',
+                        metavar='INVENTORY',
+                        type=str,
+                        help='location of inventory (default: %(default)s)',
+                        default='/etc/ansible/hosts')
+    parser.add_argument('-p',
+                        '--port',
+                        metavar='PORT',
+                        type=int,
+                        help='server port (default: %(default)s)',
+                        default=16001)
+    parser.add_argument('-q',
+                        '--quit',
+                        action='store_true',
+                        help='quit all server instances')
+    parser.add_argument('-r',
+                        '--reload',
+                        action='store_true',
+                        help='reload the inventory on all server instances')
+
+    args = parser.parse_args()
+
+    if args.reload or args.quit:
+        import psutil
+
+        for process in [x.as_dict() for x in psutil.process_iter()]:
+            if process['pid'] == os.getpid():  # Skip the current process
+                continue
+
+            if process['cmdline'] and sys.argv[0] in process['cmdline']:
+                if args.quit:
+                    os.kill(process['pid'], signal.SIGINT)
+                elif args.reload:
+                    os.kill(process['pid'], signal.SIGUSR1)
+
+        sys.exit()
+
+    if not 0 < args.port < 65536:
+        parser.error('Port outside of range 1-65535')
+
+    return args
+
+
+def attach_refresh_handler(inventory, inventory_sources):
+    """Create a signal handler for SIGUSR1 which will refresh the inventory.
+    Returns the handler."""
+    from ansible.inventory.manager import InventoryManager
+    from ansible.parsing.dataloader import DataLoader
+
+    def refresh_inventory(_1, _2):
+        inventory['manager'] = InventoryManager(loader=DataLoader(),
+                                                sources=inventory_sources)
+
+    signal.signal(signal.SIGUSR1, refresh_inventory)  # Reload handler
+    return refresh_inventory
+
+
+def create_server(port, inventory_sources):
+    """Create a server to respond to inventory pattern resolution requests. The
+    server is detached from the main process and will run in the background."""
+    if os.fork() == 0:  # Server process
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('127.0.0.1', port))
+        sock.listen(SOCK_BACKLOG)
+
+        sys.stdout = sys.stderr = open(os.devnull, 'w')  # Mute all output
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)  # Ignore terminal closure
+        os.setsid()  # Detach server from client
+
+        inventory = {'manager': None}
+        refresh_handler = attach_refresh_handler(inventory, inventory_sources)
+
+        while True:
+            try:
+                client, _ = sock.accept()  # Block until a client connects
+                pattern = client.recv(SOCK_RECV_MAX).decode()
+
+                if not inventory['manager']:  # Initial inventory load
+                    refresh_handler(None, None)
+
+                hosts = inventory['manager'].list_hosts(pattern)
+
+                response = ''.join([str(host) + '\n' for host in hosts])
+                client.sendall(response.encode())
+            except Exception:
+                pass
+            finally:
+                client.close()
+    else:  # Client process
+        time.sleep(SERVER_STARTUP_DELAY)  # Wait until server is ready
+
+
+def port_used(port):
+    """Return True if the port is accepting connections. _Slightly_ dirty."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.connect(('127.0.0.1', port))
+            return True
+        except Exception:
+            return False
+
+
+def request_hosts(port, pattern):
+    """Request the hosts matching the `pattern` from the local server listening
+    on `port`."""
+    # Connect to server and upload the pattern
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect(('127.0.0.1', port))
+    sock.sendall(pattern.encode())
+
+    response = ''
+
+    while True:  # Download the response
+        data = sock.recv(SOCK_RECV_MAX).decode()
+        response += data
+
+        if not data:  # 0-len read; socket closed
+            break
+
+    return response
+
+
+def main():
+    """Print the list of hosts matching the host pattern in the inventory."""
+    args = args_init()
+
+    if not port_used(args.port):  # Port not used; server is not running
+        create_server(args.port, args.inventory)
+
+    print(request_hosts(args.port, args.pattern), end='')
+
+
+if __name__ == '__main__':
+    sys.exit(main())
