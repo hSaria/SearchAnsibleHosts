@@ -30,5 +30,5 @@ setup(
     scripts=['search-ansible-hosts'],
     setup_requires=REQUIRES,
     url='https://github.com/hSaria/SearchAnsibleHosts',
-    version='0.0.2',
+    version='0.0.3-dev',
 )
